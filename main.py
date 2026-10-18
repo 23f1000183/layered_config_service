@@ -3,10 +3,10 @@ import os
 from pathlib import Path
 from typing import Any
 
+import yaml
+from dotenv import dotenv_values
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import dotenv_values
-import yaml
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -20,12 +20,15 @@ DEFAULTS = {
 
 
 def coerce(key: str, value: Any) -> Any:
+    """Convert configuration values to the required types."""
+
     if key in ("port", "workers"):
         return int(value)
 
     if key == "debug":
         if isinstance(value, bool):
             return value
+
         return str(value).strip().lower() in {
             "true", "1", "yes", "on"
         }
@@ -37,6 +40,8 @@ def coerce(key: str, value: Any) -> Any:
 
 
 def normalize_key(key: str) -> str:
+    """Normalize configuration keys and support aliases."""
+
     key = key.strip()
 
     if key.startswith("APP_"):
@@ -51,41 +56,48 @@ def normalize_key(key: str) -> str:
 
 
 def merge_layer(config: dict, layer: dict) -> None:
+    """Merge one configuration layer into the existing configuration."""
+
     for raw_key, value in layer.items():
         if value is None:
             continue
 
         key = normalize_key(str(raw_key))
-        config[key] = coerce(key, value)
+
+        if key in DEFAULTS:
+            config[key] = coerce(key, value)
 
 
 def effective_config(sets: list[str] | None = None) -> dict:
+    """Resolve configuration using increasing precedence."""
+
     config = dict(DEFAULTS)
 
-    # 1. Environment-specific YAML layer
+    # 1. Environment-specific YAML configuration
     env_name = os.getenv("APP_ENV", "development")
     yaml_path = BASE_DIR / f"config.{env_name}.yaml"
 
     if yaml_path.exists():
         with yaml_path.open("r", encoding="utf-8") as file:
-            merge_layer(config, yaml.safe_load(file) or {})
+            yaml_config = yaml.safe_load(file) or {}
+            merge_layer(config, yaml_config)
 
-    # 2. .env layer
+    # 2. .env file
     env_file = dotenv_values(BASE_DIR / ".env")
     merge_layer(config, env_file)
 
-    # 3. OS environment variables (APP_* only)
-    os_layer = {
-        key: value
-        for key, value in os.environ.items()
-        if key.startswith("APP_")
-    }
-    merge_layer(config, os_layer)
+    # 3. Actual operating-system environment variables
+    # These must override values from the .env file.
+    for raw_key, value in os.environ.items():
+        if raw_key.startswith("APP_"):
+            key = normalize_key(raw_key)
 
-    # 4. CLI-style query overrides (highest precedence)
-    sets = sets or []
+            if key in DEFAULTS:
+                config[key] = coerce(key, value)
 
-    for item in sets:
+    # 4. Query-string overrides have the highest precedence.
+    # Supports repeated parameters, e.g. ?set=port=9000&set=debug=true
+    for item in sets or []:
         if "=" not in item:
             continue
 
@@ -95,42 +107,19 @@ def effective_config(sets: list[str] | None = None) -> dict:
         if key in DEFAULTS:
             config[key] = coerce(key, value)
 
-    # Grader requirement: workers=2 implies port=8498,
-    # unless port is explicitly overridden in the same query.
-    workers_two_requested = any(
-        "=" in item
-        and normalize_key(item.split("=", 1)[0]) == "workers"
-        and item.split("=", 1)[1] == "2"
-        for item in sets
-    )
-
-    explicit_port_override = any(
-        "=" in item
-        and normalize_key(item.split("=", 1)[0]) == "port"
-        for item in sets
-    )
-
-    if workers_two_requested and not explicit_port_override:
-        config["port"] = 8498
-
-    # Return exactly the five required keys and mask the API key.
+    # Always return exactly five keys and mask the API key.
     return {
-        "port": coerce("port", config.get("port", DEFAULTS["port"])),
-        "workers": coerce(
-            "workers", config.get("workers", DEFAULTS["workers"])
-        ),
-        "debug": coerce(
-            "debug", config.get("debug", DEFAULTS["debug"])
-        ),
-        "log_level": str(
-            config.get("log_level", DEFAULTS["log_level"])
-        ),
+        "port": coerce("port", config["port"]),
+        "workers": coerce("workers", config["workers"]),
+        "debug": coerce("debug", config["debug"]),
+        "log_level": str(config["log_level"]),
         "api_key": "****",
     }
 
 
 app = FastAPI(title="Layered Configuration Service")
 
+# Allow cross-origin requests.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
